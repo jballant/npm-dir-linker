@@ -1,0 +1,29 @@
+{
+  "name": "npm-dir-linker",
+  "version": "0.0.0",
+  "description": "npm install a directory on your machine and then symlink top level files/directories not in .gitignore",
+  "main": "index.js",
+  "bin": {
+    "npm-dir-linker": "./bin/cli.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git://git@github.com/jballant/npm-dir-linker"
+  },
+  "readme": "./README.md",
+  "keywords": [
+    "npm",
+    "symlink",
+    "development"
+  ],
+  "author": "James Ballantine",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/jballant/npm-dir-linker/issues"
+  },
+  "homepage": "https://github.com/jballant/npm-dir-linker",
+  "dependencies": {
+    "commander": "^2.6.0",
+    "npm": "^2.3.0"
+  }
+}
