@@ -5,6 +5,13 @@ If you are developing a node module that you want to test in another node projec
 
 Instead of just symlinking the entire repo directly into node_modules for your other project, this tool respects top level files/folders in .gitignore, as well as "node_modules". That way, the "installation" looks more like a regular "npm-install" would.
 
+Install
+-------
+```
+npm install -g npm-dir-linker
+```
+
+
 Usage
 -----
 ```
