@@ -1,6 +1,6 @@
 {
   "name": "npm-dir-linker",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "npm install a directory on your machine and then symlink top level files/directories not in .gitignore",
   "main": "index.js",
   "bin": {

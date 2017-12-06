@@ -18,8 +18,9 @@ commander
     .version(pkg.version)
     .option('-m, --module <m>', 'Package module name to install [module]')
     .option('-d, --dir <path>', 'Directory to install and link [dir]')
-    .option('-v, --verbose', 'Logs more information')
     .option('-s, --linkSelf', 'Link installed module to itself in its own node_modules, if using a resolve function that encounters problems with symlinks')
+    .option('-i, --useIgnoreFile', 'Don\'t create symlinks for for top level files in the root .npmignore/.gitignore file of the local dir')
+    .option('-v, --verbose', 'Log more information')
     .parse(process.argv);
 
 if (!commander.module && !commander.dir) {
@@ -35,10 +36,30 @@ if (!commander.module) {
     throw new Error('The --module argument is required');
 }
 
+function resolveHome(filepath) {
+    if (filepath.charAt(0) === '~') {
+        return path.join(process.env.HOME, filepath.slice(1));
+    }
+    return filepath;
+}
 
-pathToRepo = path.resolve(commander.dir);
+pathToRepo = path.resolve(currentDir, resolveHome(commander.dir));
 pathToInstalled = currentDir + '/node_modules/' + commander.module;
 verbose = commander.verbose;
+
+function debug() {
+    if (verbose && arguments[0]) {
+        var args = [].slice.call(arguments, 0);
+        args[0] = pkg.name + ": VERBOSE: " + args[0];
+        console.log.apply(console, args);
+    }
+}
+
+function log() {
+    var args = [].slice.call(arguments, 0);
+    args[0] = pkg.name + ": " + args[0];
+    console.log.apply(console, args);
+}
 
 function isNodeModulesOrHidden(path) {
     return path.indexOf('.') === 0 || path.substr(-1 * ('node_modules'.length)) === 'node_modules';
@@ -49,17 +70,20 @@ function shouldIgnorePath(path) {
 }
 
 function removeDir(path, callback) {
-    exec('rm -r ' + path, function (err) {
+    debug('removing directory', path);
+    exec('rm -r ' + path, function (err, stdout, stderr) {
         if (err) { throw err; }
-        if (verbose) {
-            console.log('Removed directory %s', path);
+        if (stderr) {
+            console.error('%s error removing directory %s', pkg.name, path);
+            throw new Error(stderr);
         }
+        debug('removed directory %s', path);
         callback();
     });
 }
 
 function execNpmInstall(path, callback) {
-    console.log('%s: installing "%s" as node module\n', pkg.name, path);
+    log('installing "%s" as node module\n', path);
     npm.load(function (err) {
         if (err) {
             throw err;
@@ -68,7 +92,7 @@ function execNpmInstall(path, callback) {
             if (e) {
                 throw e;
             }
-            console.log('%s: installed node_module "%s" successfully, proceeding to replace top-level files/folders with symlinks', pkg.name, commander.module);
+            log('installed node_module "%s" successfully, proceeding to replace top-level files/folders with symlinks', commander.module);
             callback();
         });
     });
@@ -79,9 +103,7 @@ function execLinking(path, type, onCreateSymlink) {
     var dest = pathToInstalled + '/' + fileName;
     fs.symlink(path, dest, type, function (err) {
         if (err) { throw err; }
-        if (verbose) {
-            console.log('Created symlink from %s to %s', path, dest);
-        }
+        debug('created symlink from %s to %s', path, dest);
         onCreateSymlink();
     });
 }
@@ -145,8 +167,10 @@ function parseGitIgnoreTopLayer(gitIgnoreStr, onFoundTopFile, onDone) {
     var topLevelPaths = [];
     var statFn = function (path) {
         unCheckedPathsCount++;
-        fs.exists(path, function (exists) {
-            if (!exists) {
+        debug('checking if ignore file path exists: ', path);
+        fs.access(path, fs.R_OK, function (err) {
+            if (err) {
+                debug('ignore file path does not exist: ', path);
                 unCheckedPathsCount--;
                 return;
             }
@@ -154,6 +178,7 @@ function parseGitIgnoreTopLayer(gitIgnoreStr, onFoundTopFile, onDone) {
                 if (err) { throw err; }
                 unCheckedPathsCount--;
                 topLevelPaths.push({ path: path, stat: stat });
+                debug('found top level file to exclude from symlink replacement: ', path);
                 if (onFoundTopFile) {
                     onFoundTopFile(path, stat);
                 }
@@ -175,20 +200,35 @@ function parseGitIgnoreTopLayer(gitIgnoreStr, onFoundTopFile, onDone) {
 }
 
 function loadIgnoredTopPaths(onDone) {
-    var ignorePath = currentDir + '/.gitignore';
-    fs.readFile(ignorePath, { encoding: 'utf-8' }, function (err, data) {
-        if (err) { throw err; }
-        parseGitIgnoreTopLayer(data, null, function (pathInfoArr) {
-            ignoredTopPaths = pathInfoArr;
-            onDone(ignoredTopPaths);
+
+    var ignorePath = pathToRepo + '/.npmignore';
+    fs.access(ignorePath, fs.R_OK, function (err) {
+        if (err) {
+            ignorePath = pathToRepo + '/.gitignore';
+        }
+        fs.readFile(ignorePath, { encoding: 'utf-8' }, function (err, data) {
+            if (err) {
+                if (err.code === 'ENOENT') {
+                    debug('.gitignore file not found, will link every top level file except "node_modules"');
+                    data = '';
+                } else {
+                    throw err;
+                }
+            }
+            parseGitIgnoreTopLayer(data, null, function (pathInfoArr) {
+                ignoredTopPaths = pathInfoArr;
+                onDone();
+            });
         });
     });
+
 }
 
 function linkRepoFiles(callback) {
     var pathsToLink = 0;
     findTopLevelFiles(pathToRepo, function (filePath) {
         if (!shouldIgnorePath(filePath)) {
+            debug('creating symlink for path', filePath);
             pathsToLink++;
             fs.lstat(filePath, function (err, stats) {
                 if (err) { throw err; }
@@ -206,6 +246,8 @@ function linkRepoFiles(callback) {
                     }
                 }
             });
+        } else {
+            debug('will not create symlink for path', filePath);
         }
     });
 }
@@ -213,20 +255,22 @@ function linkRepoFiles(callback) {
 function onLoadedIgnoredTopPaths() {
     var onRemovedFiles = function () {
         linkRepoFiles(function () {
-            console.log("%s: successfully created symlinks for top level module files for %s!\n", pkg.name, commander.module);
+            log("successfully created symlinks for top level module files for %s!\n", commander.module);
             if (commander.linkSelf) {
                 var pathToSelfLink = pathToInstalled + '/node_modules/' + commander.module;
                 fs.symlink(pathToInstalled, pathToSelfLink, 'dir', function (err) {
                     if (err) { throw err; }
-                    console.log('%s: created symlink in "%s" node_modules dir to itself', pkg.name, pathToInstalled);
+                    log('created symlink in "%s" node_modules dir to itself', pathToInstalled);
                 });
             }
         });
     };
     var filesToRemove = 0;
+    debug('Finding top level files and directories in %s', pathToInstalled);
     findTopLevelFiles(
         pathToInstalled,
         function (filePath, stats) {
+            debug('found top level file', filePath);
             if (!isNodeModulesOrHidden(filePath)) {
                 filesToRemove++;
                 if (stats.isDirectory()) {
@@ -238,24 +282,35 @@ function onLoadedIgnoredTopPaths() {
                         }
                     });
                 } else {
+                    debug('removing path %s', filePath);
                     fs.unlink(filePath, function (err) {
                         filesToRemove--;
                         if (err) { throw err; }
                         if (verbose) {
-                            console.log('Removed file ' + filePath);
+                            log('removed file ' + filePath);
                         }
                         if (filesToRemove === 0) {
                             onRemovedFiles();
                         }
                     });
                 }
+            } else {
+                debug('path %s will not be symlinked', filePath);
             }
         }
     );
 }
 
 function onNpmInstall() {
-    loadIgnoredTopPaths(onLoadedIgnoredTopPaths);
+    if (commander.useIgnoreFile) {
+        debug('ignore file will be used to find additional top-level ' +
+            'files/directories to exclude from symlink replacement');
+        loadIgnoredTopPaths(onLoadedIgnoredTopPaths);
+    } else {
+        debug('ignore file will not be used for finding additional ' +
+            'top-level files/directories to exclude from symlink replacement');
+        onLoadedIgnoredTopPaths();
+    }
 }
 
 execNpmInstall(pathToRepo, onNpmInstall);
