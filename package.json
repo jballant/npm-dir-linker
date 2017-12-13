@@ -1,6 +1,6 @@
 {
   "name": "npm-dir-linker",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "npm install a directory on your machine and then symlink top level files/directories not in .gitignore",
   "main": "index.js",
   "bin": {
@@ -23,7 +23,9 @@
   },
   "homepage": "https://github.com/jballant/npm-dir-linker",
   "dependencies": {
+    "chokidar": "^1.7.0",
     "commander": "^2.6.0",
+    "es6-promise": "^4.1.1",
     "npm": "^2.3.0"
   }
 }

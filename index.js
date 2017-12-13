@@ -9,17 +9,22 @@ var exec = require('child_process').exec;
 var npm = require('npm');
 var currentDir = process.cwd();
 var pkg = require('./package.json');
+var chokidar = require('chokidar');
+var Promise = require('es6-promise').Promise;
+var assert = require('assert');
 var ignoredTopPaths = [];
 var pathToInstalled;
 var pathToRepo;
 var verbose;
 
+// map of top level paths to a chokidar watcher
+var watchers = {};
+
 commander
     .version(pkg.version)
-    .option('-m, --module <m>', 'Package module name to install [module]')
-    .option('-d, --dir <path>', 'Directory to install and link [dir]')
-    .option('-s, --linkSelf', 'Link installed module to itself in its own node_modules, if using a resolve function that encounters problems with symlinks')
-    .option('-i, --useIgnoreFile', 'Don\'t create symlinks for for top level files in the root .npmignore/.gitignore file of the local dir')
+    .option('-m, --module <m>', 'Package module name to install and "link" (set up watchers for) [module]')
+    .option('-d, --dir <path>', 'Directory to install and "link" (set up watchers for) [dir]')
+    .option('-i, --useIgnoreFile', 'Don\'t create watchers for for top level files in the root .npmignore/.gitignore file of the local dir')
     .option('-v, --verbose', 'Log more information')
     .parse(process.argv);
 
@@ -61,6 +66,12 @@ function log() {
     console.log.apply(console, args);
 }
 
+function errorLog() {
+    var args = [].slice.call(arguments, 0);
+    args[0] = pkg.name + ": " + args[0];
+    console.error.apply(console, args);
+}
+
 function isNodeModulesOrHidden(path) {
     return path.indexOf('.') === 0 || path.substr(-1 * ('node_modules'.length)) === 'node_modules';
 }
@@ -69,12 +80,162 @@ function shouldIgnorePath(path) {
     return isNodeModulesOrHidden(path) || ignoredTopPaths.indexOf(path) > -1;
 }
 
+var dirCreationPromises = {};
+
+/**
+ * Make a directory at the provided path. Assumes that a
+ * directory at the specified path does not exist (otherwise,
+ * the promise will be rejected. If there is already a promise
+ * to create the directory underway, this will just return
+ * the existing promise.
+ * @param {string} newDirPath
+ */
+function mkDirPromise(newDirPath) {
+    if (dirCreationPromises[newDirPath]) {
+        debug('Found promise to create directory, for path ' + newDirPath + ' in progress');
+        return dirCreationPromises[newDirPath];
+    }
+    var prom = new Promise(function (resolve, reject) {
+        debug('Making directory', newDirPath);
+        fs.access(parentDir, fs.F_OK, function (err) {
+            if (!err) {
+                debug('directory already exists', newDirPath);
+                resolve();
+            } else if (err.code === 'ENOENT') {
+                fs.mkdir(newDirPath, function (err) {
+                    if (err) {
+                        errorLog(err);
+                        reject(err);
+                    } else {
+                        resolve();
+                    }
+                });
+            } else {
+                errorLog(err);
+                reject(err);
+            }
+        });
+    });
+    dirCreationPromises[newDirPath] = prom;
+    var deleteCachedProm = function () {
+        delete dirCreationPromises[newDirPath];
+    };
+    prom.then(deleteCachedProm, deleteCachedProm);
+    return prom;
+}
+
+/**
+ * Recursively creates ancestor directories
+ * for a file path if it doesn't exist already
+ * @param filePath
+ * @returns {Promise<>}
+ */
+function createParentDirsIfNotExist(filePath) {
+    assert.ok(path.isAbsolute(filePath), 'filePath must be absolute path');
+    var parentDir = path.dirname(filePath);
+    return new Promise(function (resolve, reject) {
+        fs.access(parentDir, fs.F_OK, function (err) {
+            if (err) {
+                // only create the directory if we have the correct access err code
+                if (err.code === 'ENOENT') {
+                    debug('Parent dir ' + parentDir + ' does not exist, will create');
+                    createParentDirsIfNotExist(parentDir)
+                        .then(function () {
+                            return mkDirPromise(parentDir)
+                        })
+                        .then(resolve, reject);
+                } else {
+                    debug('Encountered unexpected error creating directory:' + err.message);
+                    reject(err);
+                }
+            } else {
+                // if the directory already exists, resolve the promise
+                resolve();
+            }
+        });
+    });
+}
+
+/**
+ * Copies a file
+ * @param {string} readFilePath
+ * @param {string} writeFilePath
+ * @returns {Promise<string>}
+ */
+function promiseCopyFile(readFilePath, writeFilePath) {
+    assert.ok(path.isAbsolute(readFilePath), 'readFilePath must be absolute path');
+    assert.ok(path.isAbsolute(writeFilePath), 'writeFilePath must be absolute path');
+    return new Promise(function (resolve, reject) {
+        debug('reading file to copy:', readFilePath);
+        return promiseReadFile(readFilePath)
+            .then(function (contents) {
+                return createParentDirsIfNotExist(writeFilePath)
+                    .then(function () {
+                        return Promise.resolve(contents);
+                    });
+            })
+            .then(function (contents) {
+                return promiseWriteFile(writeFilePath, contents);
+            })
+            .then(function () {
+                debug('wrote copied file:', writeFilePath);
+                resolve('Successfully wrote ' + writeFilePath);
+            }).catch(function (err) {
+                console.error(err);
+                reject(err);
+            });
+    });
+}
+
+/**
+ * Promisified fs.readFile
+ * @param {string} readFilePath
+ * @returns {Promise<string>}
+ */
+function promiseReadFile(readFilePath) {
+    assert.ok(path.isAbsolute(readFilePath), 'readFilePath must be absolute path');
+    return new Promise(function (resolve, reject) {
+        fs.readFile(readFilePath, 'utf-8', function (err, contents) {
+            if (err) {
+                reject(err);
+            } else {
+                resolve(contents);
+            }
+        });
+    });
+}
+
+/**
+ * Promisified fs.writeFile
+ * @param {string} writeFilePath
+ * @param {string} contents
+ * @returns {Promise<string>}
+ */
+function promiseWriteFile(writeFilePath, contents) {
+    assert.ok(path.isAbsolute(writeFilePath), 'writeFilePath must be absolute path');
+    return new Promise(function (resolve, reject) {
+        fs.writeFile(writeFilePath, contents, function (err) {
+            if (err) {
+                console.error(err);
+                reject(err);
+            } else {
+                resolve('Successfully wrote ' + writeFilePath);
+            }
+        });
+    });
+}
+
+/**
+ * Executes `rm -r <path>` to remove the directory
+ * @param path
+ * @param callback
+ */
 function removeDir(path, callback) {
     debug('removing directory', path);
     exec('rm -r ' + path, function (err, stdout, stderr) {
         if (err) { throw err; }
         if (stderr) {
-            console.error('%s error removing directory %s', pkg.name, path);
+            errorLog('%s error removing directory %s', pkg.name, path);
             throw new Error(stderr);
         }
         debug('removed directory %s', path);
@@ -92,20 +253,119 @@ function execNpmInstall(path, callback) {
             if (e) {
                 throw e;
             }
-            log('installed node_module "%s" successfully, proceeding to replace top-level files/folders with symlinks', commander.module);
+            log('installed node_module "%s" successfully, creating watchers for top-level files/folders', commander.module);
             callback();
         });
     });
 }
 
-function execLinking(path, type, onCreateSymlink) {
-    var fileName = path.split('/').pop();
-    var dest = pathToInstalled + '/' + fileName;
-    fs.symlink(path, dest, type, function (err) {
-        if (err) { throw err; }
-        debug('created symlink from %s to %s', path, dest);
-        onCreateSymlink();
+function getPathFromPackageRoot(filePath) {
+    var relativePath = path.relative(pathToRepo, filePath);
+    return path.resolve(pathToInstalled, relativePath);
+}
+
+function copyChangedFile(filePath) {
+    debug('file changed/added in repo -> updating in package', filePath);
+    return promiseCopyFile(filePath, getPathFromPackageRoot(filePath))
+        .then(function () {
+            log('updated file in package:', path.basename(filePath))
+        })
+        .catch(function (error) {
+            errorLog('Error copying file:', filePath);
+            throw error;
+        });
+}
+
+function removeDeletedFile(filePath) {
+    var fileToRemove = getPathFromPackageRoot(filePath);
+    debug('removed file in repo -> adding in package', filePath);
+    fs.unlink(fileToRemove, function (err) {
+        if (err && err.code !== 'ENOENT') {
+            errorLog('Error removing file', filePath);
+            throw err;
+        } else {
+            log('file deleted repo, removed in package:', path.basename(filePath));
+        }
     });
+}
+
+function makeAddedDirectory(dirPath) {
+    var dirPathToAdd = getPathFromPackageRoot(dirPath);
+    debug('added directory in repo -> adding in package', dirPath);
+    return mkDirPromise(dirPathToAdd)
+        .then(function () {
+            log('directory added in repo, added in package:', dirPath);
+        })
+        .catch(function (err) {
+            errorLog('Error adding newly added directory to package', dirPathToAdd);
+            throw err;
+        });
+}
+
+function removeDeletedDir(srcDir) {
+    debug('removed directory in repo -> removing in package', srcDir);
+    var dirToRemove = getPathFromPackageRoot(srcDir);
+    removeDir(dirToRemove, function (err) {
+        if (err) {
+            errorLog('Error removing directory that was removed in source repo', dirToRemove);
+            throw err;
+        } else {
+            log('directory deleted in repo, deleted matching directory in package:', srcDir);
+        }
+    })
+}
+
+function createWatcher(pathToWatch, additionalOpts) {
+    if (watchers[pathToWatch]) {
+        errorLog('already watching path:', pathToWatch);
+        return null;
+    }
+    var opts = {
+        ignored: /(^|[\/\\])\../,
+        persistent: true,
+        followSymlinks: false,
+        ignoreInitial: true
+    };
+    Object.keys(additionalOpts || {}).forEach(function (key) {
+        opts[key] = additionalOpts[key];
+    });
+    var watcher = chokidar.watch(pathToWatch, opts);
+    watcher.on('error', function (error) {
+        delete watchers[path];
+        errorLog('Error encountered watching path ', pathToWatch);
+        throw error;
+    });
+    watchers[pathToWatch] = watcher;
+    return watcher;
+}
+
+/**
+ * Create a file watcher that will copy over any
+ * added/changed files and remove any deleted files.
+ * Recursively watches from the provided path
+ * @param {string} path
+ * @param {function} onLinked
+ */
+function execWatchingForChanges(path, onLinked) {
+    var fileName = path.split('/').pop();
+    var src = pathToRepo + '/' + fileName;
+    debug('setting up watcher for path:', path);
+    var watcher = createWatcher(src);
+    if (!watcher) {
+        onLinked();
+        return;
+    }
+    watcher
+        .on('add', copyChangedFile)
+        .on('change', copyChangedFile)
+        .on('unlink', removeDeletedFile)
+        .on('addDir', makeAddedDirectory)
+        .on('unlinkDir', removeDeletedDir)
+        .on('ready', function () {
+            debug('Scanned "%s", watching for changes', src);
+            onLinked();
+        });
+    return watcher;
 }
 
 function findTopLevelFiles(path, onFile, onDone) {
@@ -137,26 +397,6 @@ function findTopLevelFiles(path, onFile, onDone) {
     });
 }
 
-function removeDirsExceptNodeModules(dirs, callback) {
-    var i = 0;
-    var dirsToRemove = 0;
-    var onRemove = function (err) {
-        if (err) { throw err; }
-        dirsToRemove--;
-        if (dirsToRemove === 0) {
-            callback();
-        }
-    };
-    var dir;
-    for (i; i < dirs.length; i++) {
-        dir = dirs[i];
-        if (!isNodeModulesOrHidden(dir)) {
-            dirsToRemove++;
-            removeDir(dir, onRemove);
-        }
-    }
-}
-
 function parseGitIgnoreTopLayer(gitIgnoreStr, onFoundTopFile, onDone) {
     var re = /([^\n]+)/g;
     var tailReg = /(\/\*?$)/;
@@ -167,10 +407,10 @@ function parseGitIgnoreTopLayer(gitIgnoreStr, onFoundTopFile, onDone) {
     var topLevelPaths = [];
     var statFn = function (path) {
         unCheckedPathsCount++;
-        debug('checking if ignore file path exists: ', path);
+        debug('checking if ignore file path exists:', path);
         fs.access(path, fs.R_OK, function (err) {
             if (err) {
-                debug('ignore file path does not exist: ', path);
+                debug('ignore file path does not exist:', path);
                 unCheckedPathsCount--;
                 return;
             }
@@ -178,7 +418,7 @@ function parseGitIgnoreTopLayer(gitIgnoreStr, onFoundTopFile, onDone) {
                 if (err) { throw err; }
                 unCheckedPathsCount--;
                 topLevelPaths.push({ path: path, stat: stat });
-                debug('found top level file to exclude from symlink replacement: ', path);
+                debug('found top level file to exclude from symlink replacement:', path);
                 if (onFoundTopFile) {
                     onFoundTopFile(path, stat);
                 }
@@ -199,116 +439,118 @@ function parseGitIgnoreTopLayer(gitIgnoreStr, onFoundTopFile, onDone) {
     }
 }
 
-function loadIgnoredTopPaths(onDone) {
-
+function loadIgnoredTopPaths() {
     var ignorePath = pathToRepo + '/.npmignore';
-    fs.access(ignorePath, fs.R_OK, function (err) {
-        if (err) {
-            ignorePath = pathToRepo + '/.gitignore';
-        }
-        fs.readFile(ignorePath, { encoding: 'utf-8' }, function (err, data) {
+    return new Promise(function (resolve, reject) {
+        fs.access(ignorePath, fs.R_OK, function (err) {
             if (err) {
-                if (err.code === 'ENOENT') {
-                    debug('.gitignore file not found, will link every top level file except "node_modules"');
-                    data = '';
-                } else {
-                    throw err;
-                }
+                ignorePath = pathToRepo + '/.gitignore';
             }
-            parseGitIgnoreTopLayer(data, null, function (pathInfoArr) {
-                ignoredTopPaths = pathInfoArr;
-                onDone();
-            });
+            promiseReadFile(ignorePath)
+                .catch(function (err) {
+                    if (err.code === 'ENOENT') {
+                        return Promise.resolve('');
+                    }
+                    return Promise.reject(err);
+                })
+                .then(function (data) {
+                    parseGitIgnoreTopLayer(data, null, function (pathInfoArr) {
+                        ignoredTopPaths = pathInfoArr;
+                        resolve(ignoredTopPaths);
+                    });
+                }).catch(function (err) {
+                    reject(err);
+                });
         });
     });
-
 }
 
-function linkRepoFiles(callback) {
-    var pathsToLink = 0;
+/**
+ * Creates a watcher for the path to the repo we
+ * are installing locally. The watcher will copy
+ * over any added files/directories and also
+ * create a recursive watcher on those new
+ * files/directories.
+ * @param {function} onReady
+ */
+function createTopLevelAddWatcher(onReady) {
+    createWatcher(pathToRepo, {
+        ignored: function (fileOrDirPath) {
+            // ignore any paths not in the top of the source repo directory
+            return fileOrDirPath !== pathToRepo;
+        }
+    })
+        .on('add', function (filePath) {
+            copyChangedFile(filePath).then(function () {
+                execWatchingForChanges(filePath, function () {
+                    log('added watcher for new top level file:', filePath);
+                });
+            });
+        })
+        .on('addDir', function (dirPath) {
+            makeAddedDirectory(dirPath).then(function () {
+                execWatchingForChanges(dirPath, function () {
+                    log('added watcher for new top level directory:', dirPath);
+                });
+            });
+        })
+        .on('ready', onReady);
+}
+
+function watchRepoPathsForChanges(callback) {
+    var pathsToWatch = 0;
+    debug('Finding top level files and directories in %s', pathToRepo);
+
+    pathsToWatch++;
+    createTopLevelAddWatcher(function () {
+        debug('watching root directory for added files/directories');
+        pathsToWatch--;
+    });
+    // create a watcher for the root of the source repo to watch
+    // for new top level files or directories
     findTopLevelFiles(pathToRepo, function (filePath) {
         if (!shouldIgnorePath(filePath)) {
-            debug('creating symlink for path', filePath);
-            pathsToLink++;
+            pathsToWatch++;
             fs.lstat(filePath, function (err, stats) {
                 if (err) { throw err; }
                 if (!stats.isSymbolicLink()) {
-                    execLinking(filePath, stats.isDirectory() ? 'junction' : 'file', function () {
-                        pathsToLink--;
-                        if (pathsToLink === 0) {
+                    execWatchingForChanges(filePath, function () {
+                        pathsToWatch--;
+                        if (pathsToWatch === 0) {
                             callback();
                         }
                     });
                 } else {
-                    pathsToLink--;
-                    if (pathsToLink === 0) {
+                    pathsToWatch--;
+                    if (pathsToWatch === 0) {
                         callback();
                     }
                 }
             });
         } else {
-            debug('will not create symlink for path', filePath);
+            debug('will not create watcher for path', filePath);
         }
     });
 }
 
 function onLoadedIgnoredTopPaths() {
-    var onRemovedFiles = function () {
-        linkRepoFiles(function () {
-            log("successfully created symlinks for top level module files for %s!\n", commander.module);
-            if (commander.linkSelf) {
-                var pathToSelfLink = pathToInstalled + '/node_modules/' + commander.module;
-                fs.symlink(pathToInstalled, pathToSelfLink, 'dir', function (err) {
-                    if (err) { throw err; }
-                    log('created symlink in "%s" node_modules dir to itself', pathToInstalled);
-                });
-            }
-        });
-    };
-    var filesToRemove = 0;
-    debug('Finding top level files and directories in %s', pathToInstalled);
-    findTopLevelFiles(
-        pathToInstalled,
-        function (filePath, stats) {
-            debug('found top level file', filePath);
-            if (!isNodeModulesOrHidden(filePath)) {
-                filesToRemove++;
-                if (stats.isDirectory()) {
-                    removeDir(filePath, function (err) {
-                        filesToRemove--;
-                        if (err) { throw err; }
-                        if (filesToRemove === 0) {
-                            onRemovedFiles();
-                        }
-                    });
-                } else {
-                    debug('removing path %s', filePath);
-                    fs.unlink(filePath, function (err) {
-                        filesToRemove--;
-                        if (err) { throw err; }
-                        if (verbose) {
-                            log('removed file ' + filePath);
-                        }
-                        if (filesToRemove === 0) {
-                            onRemovedFiles();
-                        }
-                    });
-                }
-            } else {
-                debug('path %s will not be symlinked', filePath);
-            }
-        }
-    );
+    watchRepoPathsForChanges(function () {
+        log('Created watchers for source repo');
+    });
 }
 
 function onNpmInstall() {
     if (commander.useIgnoreFile) {
         debug('ignore file will be used to find additional top-level ' +
-            'files/directories to exclude from symlink replacement');
-        loadIgnoredTopPaths(onLoadedIgnoredTopPaths);
+            'files/directories to exclude from setting up a watcher');
+        loadIgnoredTopPaths()
+            .then(onLoadedIgnoredTopPaths)
+            .catch(function (err) {
+                throw err;
+            });
     } else {
         debug('ignore file will not be used for finding additional ' +
-            'top-level files/directories to exclude from symlink replacement');
+            'top-level files/directories to exclude from setting up a watcher');
         onLoadedIgnoredTopPaths();
     }
 }
