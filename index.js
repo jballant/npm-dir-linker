@@ -1,4 +1,3 @@
-/*jslint node:true,vars:true */
 
 "use strict";
 
@@ -97,7 +96,7 @@ function mkDirPromise(newDirPath) {
     }
     var prom = new Promise(function (resolve, reject) {
         debug('Making directory', newDirPath);
-        fs.access(parentDir, fs.F_OK, function (err) {
+        fs.access(newDirPath, fs.F_OK, function (err) {
             if (!err) {
                 debug('directory already exists', newDirPath);
                 resolve();
@@ -243,19 +242,63 @@ function removeDir(path, callback) {
     });
 }
 
-function execNpmInstall(path, callback) {
-    log('installing "%s" as node module\n', path);
-    npm.load(function (err) {
+/**
+ * Install a local directory copy of an npm project
+ * by using 'npm pack' and then 'npm install' on the
+ * resulting tarball from npm pack.
+ */
+function npmLocalPackInstall(pathToPkg, callback) {
+    debug('loading npm in current working directory project');
+    npm.load({
+        prefix: currentDir
+    }, function (err) {
         if (err) {
-            throw err;
+            return callback(err);
         }
-        npm.install(path, function (e) {
-            if (e) {
-                throw e;
+        debug('executing "npm pack" on path ' + path); 
+        npm.commands.pack([pathToPkg], function (err) {
+            if (err) {
+                return callback(err);
             }
+            try {
+                debug('loading local package directory package.json');
+                var localModulePkg = require(pathToPkg + '/package.json');
+            } catch (requireErr) {
+                return callback(requireErr);
+            }
+            if (!localModulePkg.name || !localModulePkg.version) {
+                return callback(new Error('Local npm project repo must specify version and name in package.json'));
+            }
+            var tarballPath = './' + localModulePkg.name + '-' + localModulePkg.version + '.tgz'
+            debug('installing packed local repo directory');
+            npm.install(tarballPath, function (err) {
+                if (err) {
+                    return callback(err);
+                }
+                return callback();
+            });
+        });        
+    })
+
+}
+
+/**
+ * Install a local node module from a path. Avoids
+ * creating a symlink installing a packed version of 
+ * the module.
+ * @param {string} path
+ * @param {function} callback
+ */
+function execNpmInstall(pathToPkg, callback) {
+    log('installing "%s" as node module\n', pathToPkg);
+    npmLocalPackInstall(pathToPkg, function (err) {
+        if (err) {
+            errorLog('error installing local package repo from path %s', pathToPkg);
+            throw err;
+        } else {
             log('installed node_module "%s" successfully, creating watchers for top-level files/folders', commander.module);
             callback();
-        });
+        }
     });
 }
 
