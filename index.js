@@ -21,23 +21,14 @@ var watchers = {};
 
 commander
     .version(pkg.version)
-    .option('-m, --module <m>', 'Package module name to install and "link" (set up watchers for) [module]')
-    .option('-d, --dir <path>', 'Directory to install and "link" (set up watchers for) [dir]')
+    .option('-d, --dir <path>', 'Directory to install and "watch" (i.e. set up watchers for) [dir]')
     .option('-i, --useIgnoreFile', 'Don\'t create watchers for for top level files in the root .npmignore/.gitignore file of the local dir')
     .option('-v, --verbose', 'Log more information')
     .parse(process.argv);
 
-if (!commander.module && !commander.dir) {
-    commander.help();
-    return;
-}
-
 if (!commander.dir) {
-    throw new Error('The --dir argument is required');
-}
-
-if (!commander.module) {
-    throw new Error('The --module argument is required');
+    commander.help();
+    return process.exit(0);
 }
 
 function resolveHome(filepath) {
@@ -46,10 +37,6 @@ function resolveHome(filepath) {
     }
     return filepath;
 }
-
-pathToRepo = path.resolve(currentDir, resolveHome(commander.dir));
-pathToInstalled = currentDir + '/node_modules/' + commander.module;
-verbose = commander.verbose;
 
 function debug() {
     if (verbose && arguments[0]) {
@@ -70,6 +57,25 @@ function errorLog() {
     args[0] = pkg.name + ": " + args[0];
     console.error.apply(console, args);
 }
+
+pathToRepo = path.resolve(currentDir, resolveHome(commander.dir));
+
+var modulePackage;
+try {
+    modulePackage = require(pathToRepo + '/package.json');    
+} catch (e) {
+    errorLog('directory "' + pathToRepo + '" does not contain a "package.json" file');
+    return process.exit(1);
+}
+
+if (!modulePackage.name) {
+    errorLog('Module "package.json" file does not contain a "name"');
+    return process.exit(1);
+}
+
+pathToInstalled = currentDir + '/node_modules/' + modulePackage.name;
+verbose = commander.verbose;
+
 
 function isNodeModulesOrHidden(path) {
     return path.indexOf('.') === 0 || path.substr(-1 * ('node_modules'.length)) === 'node_modules';
@@ -296,7 +302,7 @@ function execNpmInstall(pathToPkg, callback) {
             errorLog('error installing local package repo from path %s', pathToPkg);
             throw err;
         } else {
-            log('installed node_module "%s" successfully, creating watchers for top-level files/folders', commander.module);
+            log('installed node_module "%s" successfully, creating watchers for top-level files/folders', modulePackage.name);
             callback();
         }
     });
