@@ -7,7 +7,7 @@ Instead of just symlink-ing the entire repo directly into `node_modules` for you
 
 NOTE: this package uses `npm pack` to install a local copy of your directory (a normal npm install would create a symlink), and as a result, you will see changes in your in the current projects `package.json` and `package-lock` to point to the installed tarball. Presumably, you might want to undo these changes when you are getting your project "production" ready. 
 
-Currently designed for npm 5.x.x.
+Currently designed for npm `6.x.x` (for npm `5.x.x` use version `0.2.0`).
 
 Why?
 ----
